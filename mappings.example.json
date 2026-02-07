@@ -1,0 +1,11 @@
+{
+  "apple_subscriptions": {
+    "9.99": "Example Service"
+  },
+  "ifood_restaurants": {
+    "Ifd*Restaurant Name": "Friendly Name"
+  },
+  "document_payees": {
+    "00.000.000/0001-00": "Company Name"
+  }
+}
