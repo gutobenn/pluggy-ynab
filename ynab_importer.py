@@ -30,11 +30,12 @@ class YNABTransactionImporter:
             transaction['account_id'],
             transaction['date'],
             transaction['amount'],
-            payee_name=transaction['payee'],
+            payee_name=transaction['payee'][:50],
             import_id=transaction['transaction_id'],
-            memo=transaction["memo"]
+            memo=transaction['memo'][:200],
         )
 
     def _filter_transaction(self, transaction: Transaction) -> bool:
         transaction_date = datetime.strptime(transaction['date'], '%Y-%m-%d')
-        return transaction_date >= self.starting_date
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.starting_date <= transaction_date <= today

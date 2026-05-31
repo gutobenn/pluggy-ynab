@@ -64,10 +64,15 @@ def main():
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     BLUE = "\033[94m"
+    RED = "\033[91m"
     BOLD = "\033[1m"
     RESET = "\033[0m"
 
     print(f"\n{BOLD}{BLUE}=== IMPORT SUMMARY ==={RESET}")
+    if 'error' in response:
+        err = response['error']
+        print(f"  {RED}YNAB API error:{RESET} {err.get('name')} - {err.get('detail')}")
+        return
     print(f"{BOLD}Imported transactions:{RESET}")
     print(f"  {GREEN}+ New transactions imported:{RESET} {len(response['data']['transaction_ids'])}")
     print(f"  {YELLOW}= Duplicate transactions:{RESET} {len(response['data']['duplicate_import_ids'])}")
