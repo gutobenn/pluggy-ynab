@@ -105,6 +105,7 @@ ENV/
 
 # Config files
 **/mappings.json
+**/accounts.json
 
 # macOS
 **/.DS_Store

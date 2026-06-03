@@ -1,0 +1,23 @@
+{
+  "accounts": [
+    {
+      "bank": "nubank",
+      "type": "checking",
+      "ynab_account": "Nome da conta corrente no YNAB",
+      "pluggy_account_id": "id-da-conta-no-pluggy"
+    },
+    {
+      "bank": "nubank",
+      "type": "credit_card",
+      "ynab_account": "Nome do cartao no YNAB",
+      "pluggy_account_id": "id-da-conta-no-pluggy"
+    },
+    {
+      "bank": "btg",
+      "type": "investment",
+      "ynab_account": "Nome da conta de investimento no YNAB",
+      "pluggy_item_id": "id-do-item-no-pluggy",
+      "enabled": false
+    }
+  ]
+}

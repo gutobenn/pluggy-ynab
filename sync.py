@@ -8,8 +8,30 @@ from ynab_sdk import YNAB
 
 from importers.checking_account import PluggyCheckingAccountData
 from importers.credit_card import PluggyCreditCardData
+from importers.investment import PluggyInvestmentData
 from importers.util import find_by_name
 from ynab_importer import YNABTransactionImporter
+
+# Maps the "type" field in accounts.json to the importer class.
+IMPORTERS = {
+    'checking': PluggyCheckingAccountData,
+    'credit_card': PluggyCreditCardData,
+    'investment': PluggyInvestmentData,
+}
+
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def load_json(path, default=None):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return default
 
 
 def main():
@@ -22,60 +44,72 @@ def main():
     default_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
     start_import_date = args.start_date or default_date
 
-    mappings = {}
-    mappings_path = os.path.join(os.path.dirname(__file__), 'mappings.json')
-    if os.path.exists(mappings_path):
-        with open(mappings_path) as f:
-            mappings = json.load(f)
+    base_dir = os.path.dirname(__file__)
+    mappings = load_json(os.path.join(base_dir, 'mappings.json'), {})
+
+    accounts_config = load_json(os.path.join(base_dir, 'accounts.json'))
+    if not accounts_config or not accounts_config.get('accounts'):
+        print(f"{RED}No accounts configured.{RESET} Copy accounts.example.json to accounts.json and fill it in.")
+        return
+
+    client_id = os.environ['PLUGGY_CLIENT_ID']
+    client_secret = os.environ['PLUGGY_CLIENT_SECRET']
 
     ynab = YNAB(os.environ['YNAB_TOKEN'])
-
     budget = find_by_name(ynab.budgets.get_budgets().data.budgets, os.environ['YNAB_BUDGET'])
     ynab_accounts = ynab.accounts.get_accounts(budget.id).data.accounts
 
     ynab_importer = YNABTransactionImporter(ynab, budget.id, start_import_date)
 
-    if os.environ.get('CARD_ACCOUNT'):
-        account = find_by_name(ynab_accounts, os.environ['CARD_ACCOUNT'])
-        pluggy_card_data = PluggyCreditCardData(
-            account.id,
-            os.environ['PLUGGY_CLIENT_ID'],
-            os.environ['PLUGGY_CLIENT_SECRET'],
-            os.environ['PLUGGY_CARD_ACCOUNT'],
-            start_import_date,
-            mappings,
-        )
-        ynab_importer.get_transactions_from(pluggy_card_data)
+    skipped = []
+    for entry in accounts_config['accounts']:
+        label = entry.get('ynab_account', '?')
 
-    if os.environ.get('CHECKING_ACCOUNT'):
-        account = find_by_name(ynab_accounts, os.environ['CHECKING_ACCOUNT'])
-        pluggy_checking_data = PluggyCheckingAccountData(
-            account.id,
-            os.environ['PLUGGY_CLIENT_ID'],
-            os.environ['PLUGGY_CLIENT_SECRET'],
-            os.environ['PLUGGY_CHECKING_ACCOUNT'],
-            start_import_date,
-            mappings,
-        )
-        ynab_importer.get_transactions_from(pluggy_checking_data)
+        if entry.get('enabled') is False:
+            continue
 
-    response = ynab_importer.save()
+        importer_cls = IMPORTERS.get(entry.get('type'))
+        if importer_cls is None:
+            print(f"{RED}Skipping '{label}': unknown type '{entry.get('type')}'.{RESET}")
+            skipped.append(label)
+            continue
 
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    RED = "\033[91m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+        try:
+            ynab_account = find_by_name(ynab_accounts, entry['ynab_account'])
+            importer = importer_cls(
+                name=entry['ynab_account'],
+                bank=entry.get('bank', ''),
+                account_id=ynab_account.id,
+                client_id=client_id,
+                client_secret=client_secret,
+                pluggy_source=entry.get('pluggy_account_id') or entry.get('pluggy_item_id'),
+                start_import_date=start_import_date,
+                mappings=mappings,
+            )
+            ynab_importer.get_transactions_from(importer)
+        except Exception as e:
+            print(f"{RED}Failed to import '{label}':{RESET} {e}")
+            skipped.append(label)
 
     print(f"\n{BOLD}{BLUE}=== IMPORT SUMMARY ==={RESET}")
+
+    if not ynab_importer.transactions:
+        print(f"  {YELLOW}Nothing to import.{RESET}")
+        if skipped:
+            print(f"  {RED}! Accounts skipped/failed:{RESET} {', '.join(skipped)}")
+        return
+
+    response = ynab_importer.save()
     if 'error' in response:
         err = response['error']
         print(f"  {RED}YNAB API error:{RESET} {err.get('name')} - {err.get('detail')}")
         return
+
     print(f"{BOLD}Imported transactions:{RESET}")
     print(f"  {GREEN}+ New transactions imported:{RESET} {len(response['data']['transaction_ids'])}")
     print(f"  {YELLOW}= Duplicate transactions:{RESET} {len(response['data']['duplicate_import_ids'])}")
+    if skipped:
+        print(f"  {RED}! Accounts skipped/failed:{RESET} {', '.join(skipped)}")
 
 
 if __name__ == '__main__':

@@ -1,10 +1,8 @@
 from .transaction import Transaction
-from .base import PluggyImporter
+from .base import AccountTransactionsImporter
 
 
-class PluggyCheckingAccountData(PluggyImporter):
-    label = "CHECKING ACCOUNT TRANSACTIONS"
-
+class PluggyCheckingAccountData(AccountTransactionsImporter):
     def _map_transaction(self, account_transaction: dict) -> Transaction:
         payee = self._get_payee(account_transaction)
         amount = self._get_amount(account_transaction)
@@ -19,9 +17,30 @@ class PluggyCheckingAccountData(PluggyImporter):
         }
 
     def _get_payee(self, account_transaction: dict) -> str:
-        description = account_transaction['description']
-        category_id = account_transaction['categoryId']
+        # Generic, cross-bank: map by the counterparty's document (CPF/CNPJ) when known.
         document_payees = self.mappings.get('document_payees', {})
+        document = self._counterparty_document(account_transaction)
+        if document and document in document_payees:
+            return document_payees[document]
+
+        if self.bank == 'nubank':
+            return self._nubank_payee(account_transaction)
+
+        return account_transaction['description']
+
+    def _counterparty_document(self, account_transaction: dict) -> str:
+        """CPF/CNPJ of the other party, from payer (incoming) or receiver (outgoing)."""
+        payment_data = account_transaction.get('paymentData') or {}
+        for side in ('payer', 'receiver'):
+            try:
+                return payment_data[side]['documentNumber']['value']
+            except (TypeError, KeyError):
+                continue
+        return None
+
+    def _nubank_payee(self, account_transaction: dict) -> str:
+        description = account_transaction['description']
+        category_id = account_transaction.get('categoryId')
 
         if description == 'Pagamento de fatura':
             return 'Nubank'
@@ -31,15 +50,6 @@ class PluggyCheckingAccountData(PluggyImporter):
             return parts[1] if len(parts) > 1 else description
 
         if description.startswith('Transferência Recebida'):
-            payer_doc = None
-            try:
-                payer_doc = account_transaction['paymentData']['payer']['documentNumber']['value']
-            except (TypeError, KeyError):
-                pass
-
-            if payer_doc and payer_doc in document_payees:
-                return document_payees[payer_doc]
-
             parts = description.split('|')
             if len(parts) > 1:
                 return parts[1]
