@@ -81,41 +81,67 @@ def list_accounts(item_id):
               f"\"type\": \"investment\", \"pluggy_item_id\": \"{item_id}\"")
 
 
+RECONCILE_SECTIONS = [
+    ('checking', 'CHECKING'),
+    ('credit_card', 'CREDIT CARDS'),
+    ('investment', 'INVESTMENTS'),
+]
+
+
+def _print_recon_row(row, ynab_by_name):
+    account = ynab_by_name.get(row['name'])
+    if account is None:
+        print(f"  {row['name']:<22}{RED}YNAB account not found{RESET}")
+        return
+
+    cleared = account.cleared_balance
+    uncleared = account.uncleared_balance
+    total = cleared + uncleared
+    pluggy = row['pluggy_balance']
+
+    if pluggy is None:
+        print(f"  {row['name']:<22}{money(cleared):>13}{money(uncleared):>13}"
+              f"{money(total):>13}{'?':>13}{'?':>11}  {YELLOW}no Pluggy balance{RESET}")
+        return
+
+    pluggy_milli = round(pluggy * 1000)
+    # Credit cards: Pluggy reports the amount owed (positive); YNAB shows it negative.
+    expected = -pluggy_milli if row['type'] == 'credit_card' else pluggy_milli
+    diff = total - expected
+    status = f"{GREEN}match{RESET}" if abs(diff) <= RECONCILE_TOLERANCE else f"{RED}MISMATCH{RESET}"
+    if row['type'] == 'investment' and row.get('positions') is not None:
+        status += f" {YELLOW}({row['positions']} pos.){RESET}"
+
+    print(f"  {row['name']:<22}{money(cleared):>13}{money(uncleared):>13}"
+          f"{money(total):>13}{money(pluggy_milli):>13}{money(diff):>11}  {status}")
+
+
 def print_reconciliation(rows, ynab_by_name):
     """Compare each account's Pluggy balance against its YNAB balance
-    (cleared + uncleared = total) and flag matches/mismatches."""
+    (cleared + uncleared = total), grouped by type, flagging match/mismatch."""
     print(f"\n{BOLD}{BLUE}=== BALANCE RECONCILIATION ==={RESET}")
-    print(f"  {BOLD}{'Account':<22}{'Type':<13}{'YNAB clr':>13}{'YNAB unclr':>13}"
-          f"{'YNAB total':>13}{'Pluggy':>13}{'Diff':>11}{RESET}  Status")
+    header = (f"  {BOLD}{'Account':<22}{'YNAB clr':>13}{'YNAB unclr':>13}"
+              f"{'YNAB total':>13}{'Pluggy':>13}{'Diff':>11}{RESET}  Status")
 
+    by_type = {}
     for row in rows:
-        account = ynab_by_name.get(row['name'])
-        if account is None:
-            print(f"  {row['name']:<22}{row['type']:<13}{RED}YNAB account not found{RESET}")
+        by_type.setdefault(row['type'], []).append(row)
+    # known sections first, then any unexpected types
+    ordered = RECONCILE_SECTIONS + [(t, t.upper()) for t in by_type if t not in dict(RECONCILE_SECTIONS)]
+
+    for type_key, title in ordered:
+        group = by_type.get(type_key)
+        if not group:
             continue
-
-        cleared = account.cleared_balance
-        uncleared = account.uncleared_balance
-        total = cleared + uncleared
-        pluggy = row['pluggy_balance']
-
-        if pluggy is None:
-            print(f"  {row['name']:<22}{row['type']:<13}{money(cleared):>13}{money(uncleared):>13}"
-                  f"{money(total):>13}{'?':>13}{'?':>11}  {YELLOW}no Pluggy balance{RESET}")
-            continue
-
-        pluggy_milli = round(pluggy * 1000)
-        # Credit cards: Pluggy reports the amount owed (positive); YNAB shows it negative.
-        expected = -pluggy_milli if row['type'] == 'credit_card' else pluggy_milli
-        diff = total - expected
-        status = f"{GREEN}match{RESET}" if abs(diff) <= RECONCILE_TOLERANCE else f"{RED}MISMATCH{RESET}"
-
-        print(f"  {row['name']:<22}{row['type']:<13}{money(cleared):>13}{money(uncleared):>13}"
-              f"{money(total):>13}{money(pluggy_milli):>13}{money(diff):>11}  {status}")
+        print(f"\n  {BOLD}{title}{RESET}")
+        print(header)
+        for row in group:
+            _print_recon_row(row, ynab_by_name)
 
     print(f"\n  {YELLOW}Note:{RESET} compares Pluggy's current balance to YNAB (cleared + uncleared). "
-          f"Credit cards are sign-inverted. A mismatch can mean missing/extra transactions, "
-          f"or history older than --from that isn't in YNAB.")
+          f"Credit cards are sign-inverted. Investments are report-only unless you pass "
+          f"{BOLD}--update-investments{RESET}, which posts the difference as a 'Rendimento' transaction. "
+          f"A mismatch can also mean missing/extra transactions or history older than --from not in YNAB.")
 
 
 def main():
@@ -129,6 +155,8 @@ def main():
                         help='Verbose output: per-page fetch counts and Pluggy totals.')
     parser.add_argument('--list-accounts', metavar='ITEM_ID',
                         help='List the Pluggy accounts/investments under an item id (to fill accounts.json) and exit.')
+    parser.add_argument('--update-investments', action='store_true',
+                        help="For investment accounts, post the YNAB↔Pluggy difference as a 'Rendimento' transaction so the tracking account catches up to the current balance.")
     args = parser.parse_args()
 
     if args.list_accounts:
@@ -137,7 +165,9 @@ def main():
 
     debug = args.debug or args.dry_run
 
-    default_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    now = datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    default_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
     start_import_date = args.start_date or default_date
 
     base_dir = os.path.dirname(__file__)
@@ -183,13 +213,29 @@ def main():
                 start_import_date=start_import_date,
                 mappings=mappings,
                 debug=debug,
+                investment_filter=entry.get('investment_filter'),
             )
             ynab_importer.get_transactions_from(importer)
             reconciliations.append({
                 'name': entry['ynab_account'],
                 'type': entry['type'],
                 'pluggy_balance': importer.pluggy_balance,
+                'positions': getattr(importer, 'matched_count', None),
             })
+
+            # Optionally true up investment tracking accounts to the live balance.
+            if args.update_investments and entry['type'] == 'investment' and importer.pluggy_balance is not None:
+                diff = round(importer.pluggy_balance * 1000) - ynab_account.balance
+                if abs(diff) > RECONCILE_TOLERANCE:
+                    ynab_importer.add_adjustment(
+                        account_id=ynab_account.id,
+                        amount=diff,
+                        date=today,
+                        payee="Rendimento",
+                        memo="Rendimento",
+                        import_id=f"REND-{today}-{ynab_account.id[:8]}",
+                    )
+                    print(f"  {GREEN}Rendimento{RESET} {entry['ynab_account']}: {money(diff)}")
         except Exception as e:
             print(f"{RED}Failed to import '{label}':{RESET} {e}")
             skipped.append(label)

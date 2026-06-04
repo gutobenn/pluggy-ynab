@@ -71,7 +71,8 @@ Cada conta tem os campos:
 - **type**: `checking`, `credit_card` ou `investment`.
 - **ynab_account**: nome exato da conta no YNAB (usado para localizar a conta destino).
 - **pluggy_account_id**: id da conta no Pluggy — para `checking` e `credit_card`.
-- **pluggy_item_id**: id do *item* no Pluggy — para `investment` (o Pluggy não tem "conta" de investimento; listamos os investimentos do item e agregamos as transações de cada um).
+- **pluggy_item_id**: id do *item* no Pluggy — para `investment`.
+- **investment_filter** (só `investment`, opcional): seleciona quais posições do item entram nesta conta. Chaves opcionais, combinadas com E (`AND`), cada uma aceitando um valor ou lista: `type` (ex.: `"FIXED_INCOME"` ou `["EQUITY","ETF","MUTUAL_FUND"]`), `subtype` (ex.: `"CDB"`), `rate` (ex.: `120` para a Caixinha Turbo do Nubank, ou `[100, 115]`). Sem filtro = todas as posições do item.
 - **enabled** (opcional): `false` para pular a conta sem removê-la.
 
 ```json
@@ -79,12 +80,13 @@ Cada conta tem os campos:
   "accounts": [
     { "bank": "nubank", "type": "checking",    "ynab_account": "Nome da conta corrente no YNAB", "pluggy_account_id": "..." },
     { "bank": "nubank", "type": "credit_card", "ynab_account": "Nome do cartao no YNAB",          "pluggy_account_id": "..." },
-    { "bank": "btg",    "type": "investment",  "ynab_account": "Nome do investimento no YNAB",    "pluggy_item_id": "...", "enabled": false }
+    { "bank": "btg",    "type": "investment",  "ynab_account": "BTG - Renda Fixa",  "pluggy_item_id": "...", "investment_filter": { "type": "FIXED_INCOME" } },
+    { "bank": "btg",    "type": "investment",  "ynab_account": "BTG - Renda Variável", "pluggy_item_id": "...", "investment_filter": { "type": ["EQUITY", "ETF", "MUTUAL_FUND"] } }
   ]
 }
 ```
 
-> **Investimentos:** as transações são importadas com sinal por tipo de movimento — `BUY`/`TRANSFER` entram como crédito e `SELL`/`TAX` como débito na tracking account do YNAB. Confira na primeira sincronização e ajuste `OUTFLOW_TYPES` em `importers/investment.py` se necessário. Se a conta de investimento também estiver no YNAB junto da conta corrente, atenção para não contar aportes em dobro.
+> **Investimentos são somente relatório.** O Pluggy expõe apenas o *saldo atual* de cada posição (não há histórico de transações de investimento), então estas contas **não geram lançamentos no YNAB**. A cada execução o saldo do Pluggy (soma das posições que casam com o `investment_filter`) é comparado ao saldo da conta no YNAB na tabela de reconciliação, marcando `match`/`MISMATCH` — você ajusta o YNAB manualmente. Dica: as "Caixinhas" do Nubank não existem no Pluggy (todas viram CDBs), mas a Turbo é identificável pela `rate` (ex.: `120`).
 
 ### 4. Mapeamentos personalizados (opcional)
 
@@ -138,4 +140,15 @@ python sync.py --dry-run --from 2020-01-01   # puxa o máximo de histórico para
 
 ### Conferência de saldos (reconciliação)
 
-Ao final de cada execução é impressa uma tabela comparando, por conta, o **saldo atual no Pluggy** com o **saldo no YNAB** (`cleared + uncleared = total`), sinalizando `match` ou `MISMATCH`. Cartões de crédito são comparados com sinal invertido (Pluggy reporta o valor devido como positivo; o YNAB mostra negativo). Um `MISMATCH` indica transações faltando/sobrando — ou histórico anterior ao `--from` que não está no YNAB.
+Ao final de cada execução é impressa uma tabela, **agrupada por tipo** (contas correntes, cartões e investimentos), comparando o **saldo atual no Pluggy** com o **saldo no YNAB** (`cleared + uncleared = total`), sinalizando `match` ou `MISMATCH`. Cartões de crédito são comparados com sinal invertido (Pluggy reporta o valor devido como positivo; o YNAB mostra negativo). Um `MISMATCH` indica transações faltando/sobrando — ou histórico anterior ao `--from` que não está no YNAB.
+
+### Atualizando investimentos (`--update-investments`)
+
+Contas de investimento são somente relatório por padrão. Como o saldo rende todo dia, o YNAB fica defasado. Com a flag, a diferença (YNAB → Pluggy) de cada conta de investimento é lançada como uma transação com memo **"Rendimento"**, atualizando a tracking account para o valor atual:
+
+```bash
+python sync.py --update-investments
+python sync.py --dry-run --update-investments   # pré-visualiza os ajustes sem gravar
+```
+
+O `import_id` é por conta e por dia (`REND-AAAA-MM-DD-…`), então rodar mais de uma vez no mesmo dia não duplica o ajuste. A diferença pode ser negativa (resgate/perda em renda variável) — o lançamento continua marcado como "Rendimento".

@@ -21,7 +21,8 @@ class PluggyImporter(DataImporter):
 
     def __init__(self, *, name: str, bank: str, account_id: str,
                  client_id: str, client_secret: str, pluggy_source: str,
-                 start_import_date: str, mappings: dict = None, debug: bool = False):
+                 start_import_date: str, mappings: dict = None, debug: bool = False,
+                 investment_filter: dict = None):
         self.name = name                       # YNAB account name, used as display label
         self.bank = bank                       # e.g. "nubank" — selects bank-specific parsing
         self.account_id = account_id           # YNAB account id (destination)
@@ -31,6 +32,7 @@ class PluggyImporter(DataImporter):
         self.start_import_date = start_import_date
         self.mappings = mappings or {}
         self.debug = debug                     # verbose per-page fetch diagnostics
+        self.investment_filter = investment_filter or {}  # used by PluggyInvestmentData only
         self.pluggy_balance = None             # current balance reported by Pluggy (account currency)
 
     def get_data(self) -> List[Transaction]:

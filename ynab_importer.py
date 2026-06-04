@@ -25,6 +25,19 @@ class YNABTransactionImporter:
     def save(self):
         return self.ynab.transactions.create_transactions(self.budget_id, self.transactions)
 
+    def add_adjustment(self, account_id: str, amount: int, date: str,
+                       payee: str, memo: str, import_id: str):
+        """Append a synthetic balance-adjustment transaction (e.g. investment yield).
+        ``amount`` is in milliunits; ``import_id`` keeps it idempotent per run."""
+        self.transactions.append(TransactionRequest(
+            account_id,
+            date,
+            amount,
+            payee_name=payee[:50],
+            import_id=import_id[:36],
+            memo=memo[:200],
+        ))
+
     def _create_transaction_request(self, transaction: Transaction) -> TransactionRequest:
         return TransactionRequest(
             transaction['account_id'],

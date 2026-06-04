@@ -15,9 +15,16 @@
     {
       "bank": "btg",
       "type": "investment",
-      "ynab_account": "Nome da conta de investimento no YNAB",
+      "ynab_account": "BTG - Renda Fixa",
       "pluggy_item_id": "id-do-item-no-pluggy",
-      "enabled": false
+      "investment_filter": { "type": "FIXED_INCOME" }
+    },
+    {
+      "bank": "btg",
+      "type": "investment",
+      "ynab_account": "BTG - Renda Variavel",
+      "pluggy_item_id": "id-do-item-no-pluggy",
+      "investment_filter": { "type": ["EQUITY", "ETF", "MUTUAL_FUND"] }
     }
   ]
 }
