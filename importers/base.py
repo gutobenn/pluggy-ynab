@@ -1,4 +1,5 @@
 import abc
+import threading
 from typing import List
 
 import requests
@@ -8,6 +9,16 @@ from .transaction import Transaction
 
 PLUGGY_API = "https://api.pluggy.ai"
 PAGE_SIZE = 500
+
+# Accounts are fetched concurrently; serialize console output so lines from
+# different threads don't interleave on the terminal.
+_PRINT_LOCK = threading.Lock()
+
+
+def safe_print(*args, **kwargs):
+    """``print`` guarded by ``_PRINT_LOCK``, for use during the concurrent fetch."""
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
 
 
 class PluggyImporter(DataImporter):
@@ -36,12 +47,13 @@ class PluggyImporter(DataImporter):
         self.pluggy_balance = None             # current balance reported by Pluggy (account currency)
 
     def get_data(self) -> List[Transaction]:
+        # Runs in a worker thread (accounts are fetched in parallel), so it does
+        # no console output of its own beyond opt-in --debug diagnostics. The
+        # caller prints the per-account dump afterwards via print_transactions().
         api_key = self._authenticate()
         raw_transactions = self._fetch_raw(api_key)
         self.pluggy_balance = self._fetch_balance(api_key)
-        transactions = [self._map_transaction(t) for t in raw_transactions]
-        self._print_transactions(transactions)
-        return transactions
+        return [self._map_transaction(t) for t in raw_transactions]
 
     @abc.abstractmethod
     def _fetch_raw(self, api_key: str) -> list:
@@ -95,8 +107,8 @@ class PluggyImporter(DataImporter):
             results.extend(batch)
             total_pages = payload.get('totalPages') or 1
             if self.debug:
-                print(f"  [debug] {label}: page {page}/{total_pages} "
-                      f"(+{len(batch)}, fetched {len(results)}, Pluggy total {payload.get('total', '?')})")
+                safe_print(f"  [debug] {label}: page {page}/{total_pages} "
+                           f"(+{len(batch)}, fetched {len(results)}, Pluggy total {payload.get('total', '?')})")
             if page >= total_pages or not batch:
                 break
             page += 1
@@ -107,7 +119,9 @@ class PluggyImporter(DataImporter):
             return int(transaction['amountInAccountCurrency'] * 1000)
         return int(transaction['amount'] * 1000)
 
-    def _print_transactions(self, transactions: List[Transaction]):
+    def print_transactions(self, transactions: List[Transaction]):
+        """Print this account's transaction dump. Called by the orchestrator on
+        the main thread (in config order) after the concurrent fetch completes."""
         GREEN = "\033[92m"
         RED = "\033[91m"
         YELLOW = "\033[93m"

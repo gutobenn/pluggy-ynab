@@ -16,7 +16,14 @@ class YNABTransactionImporter:
         self.transactions: List[TransactionRequest] = []
 
     def get_transactions_from(self, transaction_importer: DataImporter):
-        transactions = transaction_importer.get_data()
+        return self.add_transactions(transaction_importer.get_data())
+
+    def add_transactions(self, transactions: List[Transaction]):
+        """Filter already-fetched transactions by date and queue them for import.
+
+        Kept separate from the network fetch so accounts can be fetched
+        concurrently while this (shared-state) step runs on the main thread.
+        """
         transactions = filter(self._filter_transaction, transactions)
         transformed = map(self._create_transaction_request, transactions)
         self.transactions.extend(transformed)

@@ -1,5 +1,5 @@
 from .transaction import Transaction
-from .base import PluggyImporter, PLUGGY_API
+from .base import PluggyImporter, PLUGGY_API, safe_print
 
 
 class PluggyInvestmentData(PluggyImporter):
@@ -33,7 +33,7 @@ class PluggyInvestmentData(PluggyImporter):
         self.matched_count = len(matching)
         if self.debug:
             total = len(investments)
-            print(f"  [debug] {self.name}: {self.matched_count}/{total} positions match {self.investment_filter}")
+            safe_print(f"  [debug] {self.name}: {self.matched_count}/{total} positions match {self.investment_filter}")
         return sum(inv.get('balance') or 0 for inv in matching)
 
     def _matches(self, investment: dict) -> bool:

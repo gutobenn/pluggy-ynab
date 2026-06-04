@@ -1,13 +1,14 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
 from ynab_sdk import YNAB
 
-from importers.base import PLUGGY_API
+from importers.base import PLUGGY_API, safe_print
 from importers.checking_account import PluggyCheckingAccountData
 from importers.credit_card import PluggyCreditCardData
 from importers.investment import PluggyInvestmentData
@@ -148,7 +149,7 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description='Sync transactions from Pluggy to YNAB')
-    parser.add_argument('--from', dest='start_date', help='Start date for import (YYYY-MM-DD). Defaults to 30 days ago.')
+    parser.add_argument('--from', dest='start_date', help='Start date for import (YYYY-MM-DD). Defaults to 14 days ago.')
     parser.add_argument('-n', '--dry-run', action='store_true',
                         help="Fetch and print everything, but don't save to YNAB.")
     parser.add_argument('--debug', action='store_true',
@@ -167,7 +168,7 @@ def main():
 
     now = datetime.now()
     today = now.strftime('%Y-%m-%d')
-    default_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+    default_date = (now - timedelta(days=14)).strftime('%Y-%m-%d')
     start_import_date = args.start_date or default_date
 
     base_dir = os.path.dirname(__file__)
@@ -181,6 +182,8 @@ def main():
     client_id = os.environ['PLUGGY_CLIENT_ID']
     client_secret = os.environ['PLUGGY_CLIENT_SECRET']
 
+    print(f"{BOLD}{BLUE}pluggy-ynab{RESET} — importing transactions since {BOLD}{start_import_date}{RESET}")
+    print("Connecting to YNAB (loading budget and accounts)...")
     ynab = YNAB(os.environ['YNAB_TOKEN'])
     budget = find_by_name(ynab.budgets.get_budgets().data.budgets, os.environ['YNAB_BUDGET'])
     ynab_accounts = ynab.accounts.get_accounts(budget.id).data.accounts
@@ -188,7 +191,9 @@ def main():
     ynab_importer = YNABTransactionImporter(ynab, budget.id, start_import_date)
 
     skipped = []
-    reconciliations = []
+
+    # Build an importer per account first (cheap, no network here).
+    tasks = []  # list of (entry, importer, ynab_account)
     for entry in accounts_config['accounts']:
         label = entry.get('ynab_account', '?')
 
@@ -215,30 +220,64 @@ def main():
                 debug=debug,
                 investment_filter=entry.get('investment_filter'),
             )
-            ynab_importer.get_transactions_from(importer)
-            reconciliations.append({
-                'name': entry['ynab_account'],
-                'type': entry['type'],
-                'pluggy_balance': importer.pluggy_balance,
-                'positions': getattr(importer, 'matched_count', None),
-            })
-
-            # Optionally true up investment tracking accounts to the live balance.
-            if args.update_investments and entry['type'] == 'investment' and importer.pluggy_balance is not None:
-                diff = round(importer.pluggy_balance * 1000) - ynab_account.balance
-                if abs(diff) > RECONCILE_TOLERANCE:
-                    ynab_importer.add_adjustment(
-                        account_id=ynab_account.id,
-                        amount=diff,
-                        date=today,
-                        payee="Rendimento",
-                        memo="Rendimento",
-                        import_id=f"REND-{today}-{ynab_account.id[:8]}",
-                    )
-                    print(f"  {GREEN}Rendimento{RESET} {entry['ynab_account']}: {money(diff)}")
         except Exception as e:
-            print(f"{RED}Failed to import '{label}':{RESET} {e}")
+            print(f"{RED}Failed to set up '{label}':{RESET} {e}")
             skipped.append(label)
+            continue
+
+        tasks.append((entry, importer, ynab_account))
+
+    # Fetch every account from Pluggy in parallel — the run is network-bound, so
+    # concurrent requests cut wall-clock time roughly to the slowest single account.
+    # Print a live counter as each finishes so the (otherwise blank) wait shows progress.
+    results = {}  # importer -> list[Transaction]
+    if tasks:
+        total = len(tasks)
+        print(f"\n{BOLD}{BLUE}Fetching {total} account(s) from Pluggy...{RESET}")
+        with ThreadPoolExecutor(max_workers=min(total, 8)) as pool:
+            futures = {pool.submit(importer.get_data): (entry, importer)
+                       for entry, importer, _ in tasks}
+            for done, future in enumerate(as_completed(futures), start=1):
+                entry, importer = futures[future]
+                name = entry.get('ynab_account', '?')
+                try:
+                    transactions = future.result()
+                    results[importer] = transactions
+                    safe_print(f"  {GREEN}✓{RESET} [{done}/{total}] {name} "
+                               f"{YELLOW}({len(transactions)} fetched){RESET}")
+                except Exception as e:
+                    safe_print(f"  {RED}✗ [{done}/{total}] {name}: {e}{RESET}")
+
+    # Process results on the main thread, in config order, so the shared
+    # transaction list and YNAB writes stay race-free.
+    reconciliations = []
+    for entry, importer, ynab_account in tasks:
+        if importer not in results:  # fetch failed and was already reported above
+            skipped.append(entry.get('ynab_account', '?'))
+            continue
+
+        importer.print_transactions(results[importer])
+        ynab_importer.add_transactions(results[importer])
+        reconciliations.append({
+            'name': entry['ynab_account'],
+            'type': entry['type'],
+            'pluggy_balance': importer.pluggy_balance,
+            'positions': getattr(importer, 'matched_count', None),
+        })
+
+        # Optionally true up investment tracking accounts to the live balance.
+        if args.update_investments and entry['type'] == 'investment' and importer.pluggy_balance is not None:
+            diff = round(importer.pluggy_balance * 1000) - ynab_account.balance
+            if abs(diff) > RECONCILE_TOLERANCE:
+                ynab_importer.add_adjustment(
+                    account_id=ynab_account.id,
+                    amount=diff,
+                    date=today,
+                    payee="Rendimento",
+                    memo="Rendimento",
+                    import_id=f"REND-{today}-{ynab_account.id[:8]}",
+                )
+                print(f"  {GREEN}Rendimento{RESET} {entry['ynab_account']}: {money(diff)}")
 
     print(f"\n{BOLD}{BLUE}=== IMPORT SUMMARY ==={RESET}")
     if args.dry_run:
