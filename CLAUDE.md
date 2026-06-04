@@ -5,17 +5,22 @@ Syncs Brazilian bank transactions to YNAB using Pluggy as the data provider.
 ## How to run
 
 ```bash
-python sync.py               # imports the last 30 days
+python sync.py                       # imports the last 30 days
 python sync.py --from 2026-01-01
+python sync.py --dry-run             # fetch + print everything, don't save to YNAB
+python sync.py --dry-run --debug     # also print per-page fetch counts vs Pluggy's total
+python sync.py --list-accounts <ITEM_ID>   # discover Pluggy account ids for accounts.json, then exit
 ```
 
 Requires a `.env` (secrets, see `.env.example`) and an `accounts.json` (list of accounts to sync, see `accounts.example.json`) at the project root. `mappings.json` is optional (see `mappings.example.json`).
 
+Every run ends with a balance-reconciliation table comparing each account's current Pluggy balance to its YNAB balance (cleared + uncleared), flagging match/MISMATCH (credit cards sign-inverted). Transaction fetching paginates through all pages (Pluggy caps a page at 500).
+
 ## Project structure
 
-- `sync.py` - Entry point. Loads `.env` + `accounts.json` + `mappings.json`, initializes the YNAB client, then loops over the configured accounts, instantiating an importer per account via the `IMPORTERS` type→class registry. Each account is wrapped in try/except so one failure doesn't abort the run.
+- `sync.py` - Entry point. Loads `.env` + `accounts.json` + `mappings.json`, initializes the YNAB client, then loops over the configured accounts, instantiating an importer per account via the `IMPORTERS` type→class registry. Each account is wrapped in try/except so one failure doesn't abort the run. Flags: `--from`, `--dry-run`/`-n` (skip save), `--debug` (verbose), `--list-accounts <ITEM_ID>` (discovery helper, auths to Pluggy and lists accounts/investments, then exits). Ends with `print_reconciliation()` (Pluggy vs YNAB balances).
 - `ynab_importer.py` - Orchestrates importing: filters transactions by date, converts to YNAB format, batch saves.
-- `importers/base.py` - `PluggyImporter` (auth, amount→millicents, terminal output, `get_data()` flow with abstract `_fetch_raw`/`_map_transaction`) and `AccountTransactionsImporter` (fetches BANK/CREDIT accounts via `GET /transactions?accountId`).
+- `importers/base.py` - `PluggyImporter` (auth, amount→millicents, terminal output, `get_data()` flow with abstract `_fetch_raw`/`_map_transaction`, `_fetch_paginated` helper that loops all pages, `_fetch_balance` hook, `pluggy_balance` attr) and `AccountTransactionsImporter` (fetches BANK/CREDIT accounts via paginated `GET /transactions?accountId`, balance via `GET /accounts/{id}`).
 - `importers/credit_card.py` - Credit card mapping. Nubank-specific cleanup (Apple, iFood, Uber, PayPal, etc.) is gated behind `bank == 'nubank'`; other banks use the raw description.
 - `importers/checking_account.py` - Checking mapping. Cross-bank `document_payees` lookup (by payer/receiver CPF/CNPJ) runs for all banks; Nubank-specific text parsing is gated behind `bank == 'nubank'`.
 - `importers/investment.py` - `PluggyInvestmentData`. `pluggy_source` is a Pluggy *item* id; lists `GET /investments?itemId` and aggregates each investment's `GET /investments/{id}/transactions`. Sign by movement type (`OUTFLOW_TYPES = {SELL, TAX}`).

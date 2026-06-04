@@ -33,7 +33,31 @@ PLUGGY_CLIENT_ID=seu-pluggy-client-id
 PLUGGY_CLIENT_SECRET=seu-pluggy-client-secret
 ```
 
-### 2. Contas a sincronizar (`accounts.json`)
+### 2. Conectando os bancos no Pluggy e obtendo os IDs
+
+O Pluggy é uma plataforma para desenvolvedores — **não existe um botão "adicionar banco" no painel**. Cada conexão com um banco é um *item*, criado pelo fluxo do **Pluggy Connect**. Para uso pessoal, o caminho mais simples (e grátis) é o **app Demo** da sua aplicação, combinado com o **MeuPluggy** quando o conector do banco real não estiver disponível.
+
+**a) Conectar um banco**
+
+1. Acesse **dashboard.pluggy.ai** e faça login.
+2. Menu lateral → **Applications / Aplicações** → abra a sua aplicação (a mesma do `PLUGGY_CLIENT_ID` do `.env`).
+3. Na página da aplicação, clique em **"Ir para Demo"** — abre o **demo.pluggy.ai** já vinculado às credenciais da sua app. (Abra sempre por aqui, e não direto pelo `demo.pluggy.ai`, para o item ficar na mesma aplicação do `.env`.)
+4. No app Demo, clique em **conectar conta** → o widget do **Pluggy Connect** abre → escolha a instituição → faça o login/consentimento do Open Finance. Isso cria o *item*.
+   - Se um banco real (BB/Itaú/BTG) não aparecer ou for bloqueado (comum em apps de trial), conecte-o primeiro em **meu.pluggy.ai**, habilite o conector **MeuPluggy** na lista de conectores da sua app e autorize-o no app Demo — **uma vez por banco**.
+
+**b) Copiar o item id**
+
+5. No app Demo, canto superior direito → menu de **três pontos (⋮)** → **"Copiar Item ID"**.
+
+**c) Descobrir os `pluggy_account_id`**
+
+6. Liste as contas daquele item:
+   ```bash
+   python sync.py --list-accounts <ITEM_ID>
+   ```
+   Imprime cada conta (id, tipo, saldo, nome) com o trecho pronto para colar no `accounts.json`, e conta os investimentos do item. Para contas `checking`/`credit_card` use o `pluggy_account_id` impresso; para `investment` use o próprio item id como `pluggy_item_id`.
+
+### 3. Contas a sincronizar (`accounts.json`)
 
 Copie o arquivo de exemplo e liste cada conta que quer sincronizar:
 
@@ -62,7 +86,7 @@ Cada conta tem os campos:
 
 > **Investimentos:** as transações são importadas com sinal por tipo de movimento — `BUY`/`TRANSFER` entram como crédito e `SELL`/`TAX` como débito na tracking account do YNAB. Confira na primeira sincronização e ajuste `OUTFLOW_TYPES` em `importers/investment.py` se necessário. Se a conta de investimento também estiver no YNAB junto da conta corrente, atenção para não contar aportes em dobro.
 
-### 3. Mapeamentos personalizados (opcional)
+### 4. Mapeamentos personalizados (opcional)
 
 Copie o arquivo de exemplo e personalize com suas assinaturas, restaurantes, etc:
 
@@ -95,5 +119,23 @@ Exemplo:
 ## Sincronizando
 
 ```bash
-python sync.py
+python sync.py                      # importa os últimos 30 dias
+python sync.py --from 2026-01-01    # importa a partir de uma data
 ```
+
+Todas as páginas de transações são buscadas (o Pluggy limita a 500 por página), então contas movimentadas não são truncadas.
+
+### Verificando / depurando
+
+```bash
+python sync.py --dry-run            # busca e mostra tudo, mas NÃO grava no YNAB
+python sync.py --dry-run --debug    # idem, com contagem por página vs. total do Pluggy
+python sync.py --dry-run --from 2020-01-01   # puxa o máximo de histórico para conferir
+```
+
+- **`--dry-run` (`-n`)**: roda o fluxo inteiro sem salvar no YNAB. Útil para conferir se as transações estão vindo corretas antes de gravar.
+- **`--debug`**: imprime, por página, quantas transações vieram e o total que o Pluggy reporta — se `fetched == total`, você pegou tudo.
+
+### Conferência de saldos (reconciliação)
+
+Ao final de cada execução é impressa uma tabela comparando, por conta, o **saldo atual no Pluggy** com o **saldo no YNAB** (`cleared + uncleared = total`), sinalizando `match` ou `MISMATCH`. Cartões de crédito são comparados com sinal invertido (Pluggy reporta o valor devido como positivo; o YNAB mostra negativo). Um `MISMATCH` indica transações faltando/sobrando — ou histórico anterior ao `--from` que não está no YNAB.

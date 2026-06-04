@@ -1,7 +1,5 @@
 import hashlib
 
-import requests
-
 from .transaction import Transaction
 from .base import PluggyImporter, PLUGGY_API
 
@@ -22,25 +20,28 @@ class PluggyInvestmentData(PluggyImporter):
     OUTFLOW_TYPES = {'SELL', 'TAX'}
 
     def _fetch_raw(self, api_key: str) -> list:
-        headers = {"X-API-KEY": api_key}
-
-        investments = requests.get(f"{PLUGGY_API}/investments", params={
-            "itemId": self.pluggy_source,
-        }, headers=headers).json().get('results', [])
+        self._investments = self._fetch_paginated(
+            f"{PLUGGY_API}/investments", {"itemId": self.pluggy_source}, api_key,
+            label=f"{self.name} (investments)",
+        )
 
         raw = []
-        for investment in investments:
-            response = requests.get(
-                f"{PLUGGY_API}/investments/{investment['id']}/transactions",
-                params={"from": self.start_import_date, "page": 1, "pageSize": 500},
-                headers=headers,
-            )
+        for investment in self._investments:
             name = investment.get('name') or investment.get('type') or 'Investimento'
-            for transaction in response.json().get('results', []):
+            transactions = self._fetch_paginated(
+                f"{PLUGGY_API}/investments/{investment['id']}/transactions",
+                {"from": self.start_import_date}, api_key,
+                label=f"{self.name} / {name}",
+            )
+            for transaction in transactions:
                 transaction['_investment_id'] = investment['id']
                 transaction['_investment_name'] = name
                 raw.append(transaction)
         return raw
+
+    def _fetch_balance(self, api_key: str):
+        # Sum of the item's investment balances (populated by _fetch_raw).
+        return sum(inv.get('balance') or 0 for inv in getattr(self, '_investments', []))
 
     def _map_transaction(self, transaction: dict) -> Transaction:
         movement_type = transaction.get('type') or ''
