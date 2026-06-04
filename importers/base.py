@@ -1,24 +1,15 @@
 import abc
-import threading
 from typing import List
 
 import requests
+from rich.markup import escape
 
+from ui import console
 from .data_importer import DataImporter
 from .transaction import Transaction
 
 PLUGGY_API = "https://api.pluggy.ai"
 PAGE_SIZE = 500
-
-# Accounts are fetched concurrently; serialize console output so lines from
-# different threads don't interleave on the terminal.
-_PRINT_LOCK = threading.Lock()
-
-
-def safe_print(*args, **kwargs):
-    """``print`` guarded by ``_PRINT_LOCK``, for use during the concurrent fetch."""
-    with _PRINT_LOCK:
-        print(*args, **kwargs)
 
 
 class PluggyImporter(DataImporter):
@@ -49,11 +40,31 @@ class PluggyImporter(DataImporter):
     def get_data(self) -> List[Transaction]:
         # Runs in a worker thread (accounts are fetched in parallel), so it does
         # no console output of its own beyond opt-in --debug diagnostics. The
-        # caller prints the per-account dump afterwards via print_transactions().
+        # caller renders the per-account dump afterwards via ui.render_transactions().
         api_key = self._authenticate()
         raw_transactions = self._fetch_raw(api_key)
         self.pluggy_balance = self._fetch_balance(api_key)
         return [self._map_transaction(t) for t in raw_transactions]
+
+    def get_balance(self):
+        """Populate ``self.pluggy_balance`` using balance endpoints only — no
+        transactions fetched. Mirrors get_data (runs in a worker thread) for the
+        reconcile-only flow; returns the balance so the caller can display it."""
+        api_key = self._authenticate()
+        self.pluggy_balance = self._fetch_reconcile_balance(api_key)
+        return self.pluggy_balance
+
+    def diagnose(self) -> dict:
+        """Authenticate and probe this account's connection for the doctor command.
+        Mirrors get_data (runs in a worker thread) and never raises — failures are
+        returned as ``{'ok': False, 'error': ...}``."""
+        try:
+            api_key = self._authenticate()
+            info = self.check_connection(api_key)
+            info.setdefault('ok', True)
+            return info
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
 
     @abc.abstractmethod
     def _fetch_raw(self, api_key: str) -> list:
@@ -66,6 +77,24 @@ class PluggyImporter(DataImporter):
     def _fetch_balance(self, api_key: str):
         """Current balance in the account's currency, or None if unsupported."""
         return None
+
+    def _fetch_reconcile_balance(self, api_key: str):
+        """Balance for the reconcile-only flow, without fetching transactions.
+        Defaults to ``_fetch_balance`` (correct for investments, which already
+        fetch their balance independently); overridden where _fetch_balance
+        depends on records pulled during a transaction fetch."""
+        return self._fetch_balance(api_key)
+
+    def check_connection(self, api_key: str) -> dict:
+        """Health info for the doctor command. Overridden per importer type."""
+        return {}
+
+    def _fetch_item(self, api_key: str, item_id: str) -> dict:
+        """Fetch a Pluggy item (connection status, freshness, connector name)."""
+        response = requests.get(
+            f"{PLUGGY_API}/items/{item_id}", headers={"X-API-KEY": api_key}
+        )
+        return self._json_or_raise(response, f"{self.name} (item)")
 
     def _authenticate(self) -> str:
         response = requests.post(f"{PLUGGY_API}/auth", data={
@@ -107,8 +136,10 @@ class PluggyImporter(DataImporter):
             results.extend(batch)
             total_pages = payload.get('totalPages') or 1
             if self.debug:
-                safe_print(f"  [debug] {label}: page {page}/{total_pages} "
-                           f"(+{len(batch)}, fetched {len(results)}, Pluggy total {payload.get('total', '?')})")
+                console.print(
+                    f"  [muted]\\[debug] {escape(label)}: page {page}/{total_pages} "
+                    f"(+{len(batch)}, fetched {len(results)}, Pluggy total {payload.get('total', '?')})[/]"
+                )
             if page >= total_pages or not batch:
                 break
             page += 1
@@ -118,34 +149,6 @@ class PluggyImporter(DataImporter):
         if transaction.get('amountInAccountCurrency') is not None:
             return int(transaction['amountInAccountCurrency'] * 1000)
         return int(transaction['amount'] * 1000)
-
-    def print_transactions(self, transactions: List[Transaction]):
-        """Print this account's transaction dump. Called by the orchestrator on
-        the main thread (in config order) after the concurrent fetch completes."""
-        GREEN = "\033[92m"
-        RED = "\033[91m"
-        YELLOW = "\033[93m"
-        RESET = "\033[0m"
-
-        print()
-        print(f"{YELLOW}=== {self.name} ({len(transactions)}) ==={RESET}")
-
-        for transaction in reversed(transactions):
-            date = transaction['date']
-            amount = transaction['amount'] / 1000
-            amount_str = f"${amount:.2f}" if amount >= 0 else f"-${abs(amount):.2f}"
-            payee = transaction['payee']
-            memo = transaction.get('memo', '')
-
-            if amount >= 0:
-                colored_type = f"{GREEN}CREDIT{RESET}"
-            else:
-                colored_type = f"{RED}DEBIT {RESET}"
-
-            line = f"{date:<10} | {amount_str:>10} | {colored_type} | {payee}"
-            if memo and memo != payee:
-                line += f" | {memo}"
-            print(line)
 
 
 class AccountTransactionsImporter(PluggyImporter):
@@ -175,3 +178,23 @@ class AccountTransactionsImporter(PluggyImporter):
     def _fetch_balance(self, api_key: str):
         # Reuse the account record already fetched in _fetch_raw.
         return (getattr(self, '_account', None) or {}).get('balance')
+
+    def _fetch_reconcile_balance(self, api_key: str):
+        # No transaction fetch happened, so read the account record directly.
+        self._account = self._fetch_account(api_key)
+        return self._account.get('balance')
+
+    def check_connection(self, api_key: str) -> dict:
+        account = self._fetch_account(api_key)
+        info = {
+            'balance': account.get('balance'),
+            'account_name': account.get('name'),
+        }
+        item_id = account.get('itemId')
+        if item_id:
+            item = self._fetch_item(api_key, item_id)
+            info['status'] = item.get('status')
+            info['last_updated'] = item.get('lastUpdatedAt')
+            info['connector'] = (item.get('connector') or {}).get('name')
+            info['ok'] = item.get('status') in ('UPDATED', 'UPDATING', None)
+        return info

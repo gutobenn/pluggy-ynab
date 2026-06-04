@@ -1,5 +1,8 @@
+from rich.markup import escape
+
+from ui import console
 from .transaction import Transaction
-from .base import PluggyImporter, PLUGGY_API, safe_print
+from .base import PluggyImporter, PLUGGY_API
 
 
 class PluggyInvestmentData(PluggyImporter):
@@ -33,8 +36,28 @@ class PluggyInvestmentData(PluggyImporter):
         self.matched_count = len(matching)
         if self.debug:
             total = len(investments)
-            safe_print(f"  [debug] {self.name}: {self.matched_count}/{total} positions match {self.investment_filter}")
+            console.print(
+                f"  [muted]\\[debug] {escape(self.name)}: {self.matched_count}/{total} "
+                f"positions match {escape(str(self.investment_filter))}[/]"
+            )
         return sum(inv.get('balance') or 0 for inv in matching)
+
+    def check_connection(self, api_key: str) -> dict:
+        investments = self._fetch_paginated(
+            f"{PLUGGY_API}/investments", {"itemId": self.pluggy_source}, api_key,
+            label=f"{self.name} (investments)",
+        )
+        matching = [inv for inv in investments if self._matches(inv)]
+        info = {
+            'positions': len(matching),
+            'balance': sum(inv.get('balance') or 0 for inv in matching),
+        }
+        item = self._fetch_item(api_key, self.pluggy_source)
+        info['status'] = item.get('status')
+        info['last_updated'] = item.get('lastUpdatedAt')
+        info['connector'] = (item.get('connector') or {}).get('name')
+        info['ok'] = item.get('status') in ('UPDATED', 'UPDATING', None)
+        return info
 
     def _matches(self, investment: dict) -> bool:
         for key in ('type', 'subtype', 'rate'):
