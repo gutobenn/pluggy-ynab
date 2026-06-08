@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class Transaction(TypedDict):
@@ -8,3 +8,6 @@ class Transaction(TypedDict):
     amount: int
     date: str
     memo: str
+    # CPF/CNPJ of the other party, when Pluggy exposes it (checking accounts only).
+    # Used by transfer dedup to confirm a candidate pair; absent on other importers.
+    counterparty_document: NotRequired[str]

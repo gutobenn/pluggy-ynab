@@ -106,6 +106,7 @@ def main_menu() -> str:
             questionary.Choice("Sync transactions", value="sync"),
             questionary.Choice("Update investments (Rendimento)", value="update_investments"),
             questionary.Choice("Balance reconciliation", value="reconcile"),
+            questionary.Choice("Reconcile & lock (mark cleared as reconciled)", value="reconcile_commit"),
             questionary.Choice("Check connections", value="doctor"),
             questionary.Choice("Quit", value="quit"),
         ],
@@ -128,6 +129,14 @@ def select_accounts(labels: List[str]) -> List[str]:
 def confirm_show_transactions() -> bool:
     return bool(questionary.confirm(
         "Show per-account transaction details?", default=False, style=MENU_STYLE
+    ).ask())
+
+
+def confirm_reconcile_lock(account_count: int, txn_count: int) -> bool:
+    return bool(questionary.confirm(
+        f"Lock {account_count} matched account(s) — {txn_count} cleared transaction(s) — "
+        "as reconciled? This can't be undone from this CLI.",
+        default=False, style=MENU_STYLE,
     ).ask())
 
 
@@ -164,7 +173,8 @@ def render_transactions(name: str, transactions: list):
 
 def render_import_summary(*, dry_run: bool, queued: int, imported: Optional[int],
                           duplicates: Optional[int], skipped: List[str],
-                          rendimentos: List[dict], api_error: Optional[str]):
+                          rendimentos: List[dict], api_error: Optional[str],
+                          transfers: Optional[List[dict]] = None):
     lines = []
     if dry_run:
         lines.append("[warn]DRY RUN — nothing saved to YNAB.[/]")
@@ -176,6 +186,14 @@ def render_import_summary(*, dry_run: bool, queued: int, imported: Optional[int]
     else:
         lines.append(f"[ok]+ New transactions imported:[/] [bold]{imported}[/]")
         lines.append(f"[warn]= Duplicate transactions:[/] [bold]{duplicates}[/]")
+
+    if transfers:
+        lines.append(f"[ok]⇄ Transfers deduplicated:[/] [bold]{len(transfers)}[/]")
+        for transfer in transfers:
+            lines.append(
+                f"  {escape(transfer['from'])} → {escape(transfer['to'])}: "
+                f"{money(abs(transfer['amount']))} ({transfer['date']})"
+            )
 
     for rendimento in rendimentos:
         lines.append(f"[ok]Rendimento[/] {escape(rendimento['name'])}: {money(rendimento['amount'])}")
@@ -263,6 +281,34 @@ def render_reconciliation(rows: list, ynab_by_name: dict):
         "A mismatch can also mean missing/extra transactions or history older than --from "
         "not in YNAB.[/]"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reconcile & lock summary
+# --------------------------------------------------------------------------- #
+
+def render_reconcile_lock_summary(*, locked: List[dict], skipped: List[dict]):
+    """``locked``: [{'name', 'count'}] of accounts whose cleared transactions were
+    marked reconciled. ``skipped``: [{'name', 'detail', 'kind'}] where ``kind`` is
+    'error' (red) or anything else (yellow — mismatch / nothing to lock / investment)."""
+    lines = []
+    if locked:
+        total = sum(item['count'] for item in locked)
+        lines.append(f"[ok]✓ Reconciled (locked):[/] [bold]{total}[/] transaction(s) "
+                     f"across {len(locked)} account(s)")
+        for item in locked:
+            lines.append(f"  {escape(item['name'])}: [bold]{item['count']}[/]")
+    else:
+        lines.append("[warn]Nothing locked.[/]")
+
+    for item in skipped:
+        style = "err" if item.get('kind') == 'error' else "warn"
+        lines.append(f"[{style}]• {escape(item['name'])}[/] — {escape(item['detail'])}")
+
+    body = Group(*[Text.from_markup(line) for line in lines])
+    console.print()
+    console.print(Panel(body, title="Reconcile & Lock", title_align="left",
+                        border_style="head", expand=False, padding=(0, 2)))
 
 
 # --------------------------------------------------------------------------- #

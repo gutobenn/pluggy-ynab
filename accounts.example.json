@@ -1,4 +1,5 @@
 {
+  "dedup_window_days": 3,
   "accounts": [
     {
       "bank": "nubank",

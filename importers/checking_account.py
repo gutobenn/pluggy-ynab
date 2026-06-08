@@ -4,10 +4,11 @@ from .base import AccountTransactionsImporter
 
 class PluggyCheckingAccountData(AccountTransactionsImporter):
     def _map_transaction(self, account_transaction: dict) -> Transaction:
-        payee = self._get_payee(account_transaction)
+        document = self._counterparty_document(account_transaction)
+        payee = self._get_payee(account_transaction, document)
         amount = self._get_amount(account_transaction)
 
-        return {
+        transaction: Transaction = {
             'transaction_id': account_transaction['id'],
             'account_id': self.account_id,
             'amount': amount,
@@ -15,11 +16,16 @@ class PluggyCheckingAccountData(AccountTransactionsImporter):
             'date': account_transaction['date'][0:10],
             'memo': payee,
         }
+        # Carry the counterparty CPF/CNPJ so transfer dedup can confirm pairs.
+        if document:
+            transaction['counterparty_document'] = document
+        return transaction
 
-    def _get_payee(self, account_transaction: dict) -> str:
+    def _get_payee(self, account_transaction: dict, document: str = None) -> str:
         # Generic, cross-bank: map by the counterparty's document (CPF/CNPJ) when known.
         document_payees = self.mappings.get('document_payees', {})
-        document = self._counterparty_document(account_transaction)
+        if document is None:
+            document = self._counterparty_document(account_transaction)
         if document and document in document_payees:
             return document_payees[document]
 

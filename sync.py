@@ -15,6 +15,7 @@ from importers.base import PLUGGY_API
 from importers.checking_account import PluggyCheckingAccountData
 from importers.credit_card import PluggyCreditCardData
 from importers.investment import PluggyInvestmentData
+from importers.transfer_match import DEDUP_WINDOW_DAYS, find_transfer_pairs
 from importers.util import find_by_name
 from ynab_importer import YNABTransactionImporter
 
@@ -194,12 +195,19 @@ def _present_balance(balance):
 # --------------------------------------------------------------------------- #
 
 def run_sync(session, *, start_import_date, today, dry_run, update_investments,
-             selected_labels, show_transactions, debug):
+             selected_labels, show_transactions, debug, dedup_transfers=True):
     session.connect_ynab()
     ynab_importer = YNABTransactionImporter(session.ynab, session.budget.id, start_import_date)
     tasks, skipped = build_importers(session, selected_labels, start_import_date, debug, require_ynab=True)
 
     results = run_concurrently(tasks, lambda imp: imp.get_data(), _present_fetch, total_label="Fetching")
+
+    # Pair transfers between two synced accounts so each is posted as a single
+    # YNAB transfer (on the sender; YNAB auto-creates the receiving mirror) rather
+    # than two unrelated transactions. ``consumed_ids`` are then skipped below.
+    consumed_ids, transfers = (set(), [])
+    if dedup_transfers:
+        consumed_ids, transfers = _dedup_transfers(ynab_importer, tasks, results, session)
 
     # Process on the main thread, in config order, so the shared transaction
     # list and YNAB writes stay race-free.
@@ -210,7 +218,8 @@ def run_sync(session, *, start_import_date, today, dry_run, update_investments,
             skipped.append(entry.get('ynab_account', '?'))
             continue
 
-        ynab_importer.add_transactions(results[importer])
+        account_txns = [t for t in results[importer] if t['transaction_id'] not in consumed_ids]
+        ynab_importer.add_transactions(account_txns)
         reconciliations.append({
             'name': entry['ynab_account'],
             'type': entry['type'],
@@ -227,8 +236,42 @@ def run_sync(session, *, start_import_date, today, dry_run, update_investments,
             if importer in results:
                 ui.render_transactions(entry['ynab_account'], results[importer])
 
-    _save_and_render_summary(ynab_importer, dry_run=dry_run, skipped=skipped, rendimentos=rendimentos)
+    _save_and_render_summary(ynab_importer, dry_run=dry_run, skipped=skipped,
+                             rendimentos=rendimentos, transfers=transfers)
     _render_reconciliation(session, reconciliations, dry_run=dry_run)
+
+
+def _dedup_transfers(ynab_importer, tasks, results, session):
+    """Detect transfers between two synced accounts and queue each as one YNAB
+    transfer on the sending account. Returns ``(consumed_ids, transfers)`` — the
+    set of paired Pluggy transaction_ids (skipped from the normal import) and a
+    summary list for the import panel. Only considers in-window transactions, so
+    pairing never consumes a leg that wouldn't have been imported."""
+    window = (session.accounts_config or {}).get('dedup_window_days', DEDUP_WINDOW_DAYS)
+    account_txns = [
+        (ynab_account, ynab_importer.eligible(results[importer]))
+        for _, importer, ynab_account in tasks
+        if importer in results and ynab_account is not None
+    ]
+    pairs, consumed_ids = find_transfer_pairs(account_txns, window_days=window)
+
+    transfers = []
+    for pair in pairs:
+        ynab_importer.add_transfer(
+            from_account_id=pair.debit_acct.id,
+            to_transfer_payee_id=pair.credit_acct.transfer_payee_id,
+            amount=pair.debit['amount'],
+            date=pair.debit['date'],
+            memo='',  # the transfer payee ("Transfer : <account>") is self-describing
+            import_id=pair.debit['transaction_id'],
+        )
+        transfers.append({
+            'from': pair.debit_acct.name,
+            'to': pair.credit_acct.name,
+            'amount': pair.debit['amount'],
+            'date': pair.debit['date'],
+        })
+    return consumed_ids, transfers
 
 
 def run_update_investments(session, today, debug):
@@ -293,7 +336,7 @@ def _maybe_post_rendimento(ynab_importer, entry, importer, ynab_account, today, 
     rendimentos.append({'name': entry['ynab_account'], 'amount': diff})
 
 
-def _save_and_render_summary(ynab_importer, *, dry_run, skipped, rendimentos):
+def _save_and_render_summary(ynab_importer, *, dry_run, skipped, rendimentos, transfers=None):
     queued = len(ynab_importer.transactions)
     imported = duplicates = api_error = None
     if not dry_run and queued:
@@ -307,7 +350,8 @@ def _save_and_render_summary(ynab_importer, *, dry_run, skipped, rendimentos):
 
     ui.render_import_summary(dry_run=dry_run, queued=queued, imported=imported,
                              duplicates=duplicates, skipped=skipped,
-                             rendimentos=rendimentos, api_error=api_error)
+                             rendimentos=rendimentos, api_error=api_error,
+                             transfers=transfers)
 
 
 def _render_reconciliation(session, reconciliations, *, dry_run):
@@ -346,6 +390,91 @@ def run_reconcile(session, selected_labels, debug):
         console.print(f"\n[err]! Accounts skipped/failed:[/] {', '.join(skipped)}")
     if reconciliations:
         ui.render_reconciliation(reconciliations, {a.name: a for a in session.ynab_accounts})
+
+
+def run_reconcile_commit(session, selected_labels, debug, *, interactive=True):
+    """Reconcile & lock: for each selected account whose Pluggy balance matches
+    YNAB's CLEARED balance within tolerance, mark its cleared transactions as
+    reconciled (the lock icon). Mismatched accounts are reported and skipped —
+    never auto-adjusted. Imports (and investment Rendimento adjustments) land
+    uncleared, so only transactions already cleared in YNAB are eligible to lock."""
+    session.connect_ynab()
+    tasks, setup_skipped = build_importers(session, selected_labels, default_start_date(), debug, require_ynab=True)
+    skipped = [{'name': s, 'detail': 'setup failed', 'kind': 'error'} for s in setup_skipped]
+
+    results = run_concurrently(tasks, lambda imp: imp.get_balance(), _present_balance,
+                               total_label="Fetching balances for")
+
+    fresh = session.refresh_ynab_accounts()
+    ynab_by_name = {a.name: a for a in fresh}
+
+    reconciliations = []
+    to_lock = []  # (name, account)
+    for entry, importer, _ in tasks:
+        name = entry.get('ynab_account', '?')
+        if importer not in results:  # fetch failed and was already shown
+            skipped.append({'name': name, 'detail': 'fetch failed', 'kind': 'error'})
+            continue
+        reconciliations.append({
+            'name': name,
+            'type': entry['type'],
+            'pluggy_balance': importer.pluggy_balance,
+            'positions': getattr(importer, 'matched_count', None),
+        })
+        account = ynab_by_name.get(name)
+        if account is None:
+            skipped.append({'name': name, 'detail': 'YNAB account not found', 'kind': 'error'})
+            continue
+        if importer.pluggy_balance is None:
+            skipped.append({'name': name, 'detail': 'no Pluggy balance', 'kind': 'info'})
+            continue
+        pluggy_milli = round(importer.pluggy_balance * 1000)
+        # Credit cards: Pluggy reports the amount owed (positive); YNAB shows it negative.
+        expected = -pluggy_milli if entry['type'] == 'credit_card' else pluggy_milli
+        diff = expected - account.cleared_balance
+        if abs(diff) > ui.RECONCILE_TOLERANCE:
+            skipped.append({'name': name,
+                            'detail': f"cleared balance off by {ui.money(diff)} — not locking",
+                            'kind': 'mismatch'})
+            continue
+        to_lock.append((name, account))
+
+    # Show the same read-only table first, so the user sees the full picture.
+    if reconciliations:
+        ui.render_reconciliation(reconciliations, ynab_by_name)
+
+    ynab_importer = YNABTransactionImporter(session.ynab, session.budget.id, default_start_date())
+    lock_plan = []  # (name, [transaction_id])
+    for name, account in to_lock:
+        try:
+            ids = ynab_importer.fetch_cleared_transaction_ids(account.id)
+        except Exception as e:
+            skipped.append({'name': name, 'detail': f"could not list transactions: {e}", 'kind': 'error'})
+            continue
+        if not ids:
+            skipped.append({'name': name, 'detail': 'no cleared transactions to lock', 'kind': 'info'})
+            continue
+        lock_plan.append((name, ids))
+
+    if not lock_plan:
+        ui.render_reconcile_lock_summary(locked=[], skipped=skipped)
+        return
+
+    total_txns = sum(len(ids) for _, ids in lock_plan)
+    if interactive and not ui.confirm_reconcile_lock(len(lock_plan), total_txns):
+        console.print("[warn]Cancelled — nothing locked.[/]")
+        return
+
+    locked = []
+    for name, ids in lock_plan:
+        result = ynab_importer.reconcile_transactions(ids)
+        if result.get('reconciled'):
+            locked.append({'name': name, 'count': result['reconciled']})
+        if 'error' in result:
+            skipped.append({'name': name, 'detail': f"PATCH failed: {result['error']}", 'kind': 'error'})
+
+    ui.render_reconcile_lock_summary(locked=locked, skipped=skipped)
+    session.ynab_accounts = session.refresh_ynab_accounts()
 
 
 def run_doctor(session, selected_labels, debug):
@@ -393,7 +522,7 @@ def run_discovery(session, item_id):
 # Interactive menu
 # --------------------------------------------------------------------------- #
 
-def run_menu(session, *, start_import_date, today, debug):
+def run_menu(session, *, start_import_date, today, debug, dedup_transfers=True):
     if not session.has_accounts():
         return
     ui.banner(start_import_date)
@@ -411,11 +540,14 @@ def run_menu(session, *, start_import_date, today, debug):
                 run_sync(session,
                          start_import_date=start_import_date, today=today,
                          dry_run=False, update_investments=False,
-                         selected_labels=labels, show_transactions=show_transactions, debug=debug)
+                         selected_labels=labels, show_transactions=show_transactions,
+                         debug=debug, dedup_transfers=dedup_transfers)
         elif action == 'update_investments':
             run_update_investments(session, today, debug)
         elif action == 'reconcile':
             run_reconcile(session, selected_labels=None, debug=debug)
+        elif action == 'reconcile_commit':
+            run_reconcile_commit(session, selected_labels=None, debug=debug)
         elif action == 'doctor':
             run_doctor(session, selected_labels=None, debug=debug)
 
@@ -439,6 +571,10 @@ def parse_args():
                         help='Check each connection (auth + Pluggy reachability + freshness) and exit.')
     parser.add_argument('--reconcile', action='store_true',
                         help='Show only the balance reconciliation (Pluggy vs YNAB balances, no import) and exit.')
+    parser.add_argument('--reconcile-commit', dest='reconcile_commit', action='store_true',
+                        help='Reconcile & lock: mark cleared transactions as reconciled for accounts whose cleared balance matches Pluggy, then exit. Mismatches are reported, never auto-adjusted.')
+    parser.add_argument('--no-dedup-transfers', dest='no_dedup_transfers', action='store_true',
+                        help='Disable transfer deduplication (import transfers between two synced accounts as two separate transactions instead of one YNAB transfer).')
     parser.add_argument('--list-accounts', metavar='ITEM_ID',
                         help='List the Pluggy accounts/investments under an item id (to fill accounts.json) and exit.')
     parser.add_argument('--update-investments', action='store_true',
@@ -468,6 +604,13 @@ def main():
         if session.has_accounts():
             run_reconcile(session, selected_labels=None, debug=args.debug)
         return
+    if args.reconcile_commit:
+        if session.has_accounts():
+            run_reconcile_commit(session, selected_labels=None, debug=args.debug,
+                                 interactive=sys.stdin.isatty())
+        return
+
+    dedup_transfers = not args.no_dedup_transfers
 
     # Show the menu when launched bare in a terminal; flags (and no TTY, e.g.
     # cron) run a sync non-interactively.
@@ -476,7 +619,8 @@ def main():
     interactive = args.menu or (sys.stdin.isatty() and not any_action_flag and not args.no_menu)
 
     if interactive:
-        run_menu(session, start_import_date=start_import_date, today=today, debug=args.debug)
+        run_menu(session, start_import_date=start_import_date, today=today,
+                 debug=args.debug, dedup_transfers=dedup_transfers)
         return
 
     if not session.has_accounts():
@@ -485,7 +629,8 @@ def main():
     run_sync(session,
              start_import_date=start_import_date, today=today,
              dry_run=args.dry_run, update_investments=args.update_investments,
-             selected_labels=None, show_transactions=args.show_transactions, debug=args.debug)
+             selected_labels=None, show_transactions=args.show_transactions,
+             debug=args.debug, dedup_transfers=dedup_transfers)
 
 
 if __name__ == '__main__':
